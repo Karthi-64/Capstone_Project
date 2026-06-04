@@ -1,0 +1,27 @@
+{
+  "/Users/KarthikPeddinti/Downloads/File_Monitoring_System(testing)/watched_folder": {
+    "name": "Brake System Document Review",
+    "steps": [
+      {
+        "step": 1,
+        "name": "Verify File Integrity",
+        "description": "Check the file size and type to ensure it is a text file and not corrupted."
+      },
+      {
+        "step": 2,
+        "name": "Review File Content",
+        "description": "Read the file content to understand the purpose and context of the document."
+      },
+      {
+        "step": 3,
+        "name": "Identify Key Information",
+        "description": "Extract relevant information from the file, such as brake system components and inventory verification."
+      },
+      {
+        "step": 4,
+        "name": "Document Review Complete",
+        "description": "Confirm that the file has been thoroughly reviewed and all necessary information has been extracted."
+      }
+    ]
+  }
+}

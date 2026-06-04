@@ -200,36 +200,87 @@ def dispatch_popups(file_queue: queue.Queue, folders: list[str]):
         log.info(f"Batch of {len(batch)} file(s) ready for review.")
 
         # ── Optional: AI workflow analysis ──────────────────────
+# ── Automatic AI workflow organization ─────────────────
         if _agent_available:
+
             from agent import analyse_file
-            from workflow_popup import WorkflowPopup
 
-            # Analyse each file (runs in bg threads)
-            results = {}
-            threads = []
             for fp, _ in batch:
-                # Determine which watched folder this file is in
+
+                if not Path(fp).exists():
+                    continue
+
                 parent = str(Path(fp).parent)
-                def _run(filepath=fp, folder=parent):
-                    results[filepath] = analyse_file(filepath, folder)
-                t = threading.Thread(target=_run, daemon=True)
-                t.start()
-                threads.append(t)
 
-            # Show workflow popup — it polls until threads finish
-            wp = WorkflowPopup(batch, results, threads)
-            wp.run()   # blocks until user clicks Continue →
+                result = analyse_file(
+                    fp,
+                    parent
+                )
 
-        # ── Guardian batch popup ─────────────────────────────────
-        try:
-            popup = BatchGuardianPopup(
-                batch     = batch,
-                on_allow  = handle_allow,
-                on_deny   = handle_deny,
-            )
-            popup.run()
-        except Exception as e:
-            log.error(f"Popup error: {e}")
+                if "error" in result:
+                    log.error(
+                        f"AI error for {Path(fp).name}: "
+                        f"{result['error']}"
+                    )
+                    continue
+
+                if result.get("empty_file"):
+                    log.info(
+                        f"Skipping empty file → "
+                        f"{Path(fp).name}"
+                    )
+                    continue
+
+                target = result.get(
+                    "target_folder"
+                )
+
+                if not target:
+                    log.warning(
+                        f"No target folder for "
+                        f"{Path(fp).name}"
+                    )
+                    continue
+
+                target_path = Path(target)
+
+                target_path.mkdir(
+                    parents=True,
+                    exist_ok=True
+                )
+
+                destination = (
+                    target_path /
+                    Path(fp).name
+                )
+
+                try:
+
+                    shutil.move(
+                        fp,
+                        str(destination)
+                    )
+
+                    log.info(
+                        f"Moved → {destination}"
+                    )
+
+                except Exception as e:
+
+                    log.error(
+                        f"Move failed: {e}"
+                    )
+
+                # ── Guardian batch popup ─────────────────────────────────
+                try:
+                    popup = BatchGuardianPopup(
+                        batch     = batch,
+                        on_allow  = handle_allow,
+                        on_deny   = handle_deny,
+                    )
+                    popup.run()
+                except Exception as e:
+                    log.error(f"Popup error: {e}")
 
 
 # ═══════════════════════════════════════════════════════════════
