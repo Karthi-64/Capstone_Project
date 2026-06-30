@@ -1,7 +1,11 @@
 __pycache__/
 *.pyc
+.env
+.venv/
 .guardian_quarantine/
 watched_folder/
+knowledge/
+workflows.json
 .DS_Store
 Thumbs.db
 .vscode/

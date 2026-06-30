@@ -1,0 +1,12 @@
+watchdog
+groq
+python-docx
+openpyxl
+pypdf
+langchain
+langchain-groq
+langchain-community
+langchain-text-splitters
+langgraph
+chromadb
+sentence-transformers

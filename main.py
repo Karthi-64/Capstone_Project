@@ -2,13 +2,12 @@
 #
 # Usage
 # ─────
-#   python main.py                       # watches ./watched_folder (auto-created)
-#   python main.py /path/to/your/folder
+#   python main.py folder1 [folder2] [folder3] [folder4]
+#   python main.py   (uses ./watched_folder by default)
 #
 # Requirements
 # ────────────
-#   pip install watchdog
-#   pip install python-docx   (optional – richer .docx metadata)
+#   pip install -r requirements.txt
 
 import sys
 import os
@@ -23,188 +22,239 @@ from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
 from file_info import MONITORED_EXTENSIONS
-from popup import GuardianPopup
 
-# ── Logging ──────────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format='[%(asctime)s] %(levelname)s  %(message)s',
-    datefmt='%H:%M:%S',
-)
+log_format = '[%(asctime)s] %(levelname)s  %(message)s'
+logging.basicConfig(level=logging.INFO, format=log_format, datefmt='%H:%M:%S')
 log = logging.getLogger('FolderGuardian')
 
-# ── Quarantine folder (files go here on Deny if no origin known) ─
-QUARANTINE_SUBDIR = '.guardian_quarantine'
-
-# ── macOS / system files to always ignore ───────────────────────
 IGNORED_NAMES = {
     '.DS_Store', '.DS_Store?', '._DS_Store',
-    'Thumbs.db', 'desktop.ini',        # Windows equivalents
-    '.localized', '.Spotlight-V100',
-    '.fseventsd', '.Trashes',
+    'Thumbs.db', 'desktop.ini', '.localized',
+    '.Spotlight-V100', '.fseventsd', '.Trashes',
 }
+
+# How long to wait for a matching on_moved after on_created (seconds)
+MOVE_WINDOW = 1.0
+# How long to collect files into a batch before showing popup (seconds)
+BATCH_WINDOW = 2.0
 
 
 # ═══════════════════════════════════════════════════════════════
-#  Allow / Deny callbacks
+#  Allow / Deny
 # ═══════════════════════════════════════════════════════════════
 
 def handle_allow(filepath: str):
     log.info(f"✓ ALLOWED  →  {Path(filepath).name}")
 
 
-def handle_deny(filepath: str, folder: str, origin: str | None = None):
-    """
-    Deny logic:
-      • If we know where the file came from (drag-move), send it back there.
-      • If the file was copied in (no known origin), quarantine it.
-    """
+def handle_deny(filepath: str, origin: str | None = None):
     src = Path(filepath)
-
-    # ── Case 1: origin known → restore to original location ──────
+    if not src.exists():
+        log.warning(f"✕ DENY  →  {src.name} no longer exists, nothing to return.")
+        return
     if origin:
-        origin_path = Path(origin)
-        # If original file now exists at origin (shouldn't, but safety check),
-        # rename destination to avoid collision
-        dest = origin_path
+        dest = Path(origin)
         if dest.exists():
             ts   = int(time.time())
-            dest = origin_path.parent / f"{origin_path.stem}_{ts}{origin_path.suffix}"
+            dest = dest.parent / f"{dest.stem}_{ts}{dest.suffix}"
         try:
             shutil.move(str(src), str(dest))
             log.info(f"✕ DENIED   →  {src.name}  (returned to {dest.parent})")
-            return
         except Exception as e:
-            log.warning(f"Could not return {src.name} to origin ({e}), quarantining instead.")
-
-    # ── Case 2: no origin (file was copied) → quarantine ─────────
-    quarantine = Path(folder) / QUARANTINE_SUBDIR
-    quarantine.mkdir(exist_ok=True)
-
-    dest = quarantine / src.name
-    if dest.exists():
-        ts   = int(time.time())
-        dest = quarantine / f"{src.stem}_{ts}{src.suffix}"
-
-    try:
-        shutil.move(str(src), str(dest))
-        log.info(f"✕ DENIED   →  {src.name}  (moved to quarantine — no origin known)")
-    except Exception as e:
-        log.warning(f"Could not quarantine {src.name}: {e}")
+            log.warning(f"Could not return {src.name} to origin: {e}")
+    else:
+        try:
+            src.unlink()   # delete denied copied file
+            log.info(f"✕ DENIED   →  {src.name}  (removed)")
+        except Exception as e:
+            log.warning(f"Could not remove denied file {src.name}: {e}")
 
 
 # ═══════════════════════════════════════════════════════════════
 #  File-system event handler
+#  KEY FIX: pending-window approach solves macOS on_created → on_moved race
 # ═══════════════════════════════════════════════════════════════
 
 class FolderHandler(FileSystemEventHandler):
-    """
-    Watches a single flat folder (non-recursive).
-    Tracks origin path for moved files so Deny can restore them.
-    Ignores macOS system files, quarantine dir, and temp files.
-    """
-
-    TEMP_SUFFIXES = {'.tmp', '.part', '.crdownload', '.download',
-                     '.swp', '.lock', '~'}
+    TEMP_SUFFIXES = {'.tmp', '.part', '.crdownload', '.download', '.swp', '.lock'}
 
     def __init__(self, folder: str, file_queue: queue.Queue):
         super().__init__()
         self.folder     = str(Path(folder).resolve())
         self.file_queue = file_queue
-        self._seen: set[str] = set()
-        # Maps resolved dest_path → original src_path for moved files
-        self._origins: dict[str, str] = {}
+        # pending: filename → {'dest': str, 'origin': str|None, 'timer': Timer}
+        self._pending: dict[str, dict] = {}
+        self._lock = threading.Lock()
 
     def _is_relevant(self, path_str: str) -> bool:
         p   = Path(path_str)
         ext = p.suffix.lower()
-
-        # Must be directly inside the watched folder
-        if str(p.parent.resolve()) != self.folder:
-            return False
-
-        # Ignore quarantine subfolder
-        if QUARANTINE_SUBDIR in p.parts:
-            return False
-
-        # Ignore macOS / OS system files by name
-        if p.name in IGNORED_NAMES or p.name.startswith('._'):
-            return False
-
-        # Must match a monitored extension
-        if ext not in MONITORED_EXTENSIONS:
-            return False
-
-        # Ignore temp / partial files
-        if ext in self.TEMP_SUFFIXES or p.name.startswith('~'):
-            return False
-
+        if str(p.parent.resolve()) != self.folder:            return False
+        if p.name in IGNORED_NAMES or p.name.startswith('._'): return False
+        if ext not in MONITORED_EXTENSIONS:                    return False
+        if ext in self.TEMP_SUFFIXES or p.name.startswith('~'): return False
         return True
 
-    def _enqueue(self, dest_str: str, origin_str: str | None = None):
-        resolved = str(Path(dest_str).resolve())
-        if resolved in self._seen:
+    def _commit(self, filename: str):
+        """Called by timer after MOVE_WINDOW — file is ready to queue."""
+        with self._lock:
+            entry = self._pending.pop(filename, None)
+        if not entry:
             return
-        self._seen.add(resolved)
-
-        if origin_str:
-            self._origins[resolved] = origin_str
-
-        def _delayed():
-            time.sleep(0.4)
-            if Path(resolved).exists():
-                origin = self._origins.get(resolved)        # may be None
-                self.file_queue.put((resolved, origin))
-                log.info(f"Queued  →  {Path(resolved).name}"
-                         + (f"  (from {Path(origin).parent})" if origin else "  (copied in)"))
-
-        threading.Thread(target=_delayed, daemon=True).start()
+        dest   = entry['dest']
+        origin = entry['origin']
+        if Path(dest).exists():
+            self.file_queue.put((dest, origin))
+            log.info(f"Queued  →  {filename}"
+                     + (f"  (from {Path(origin).parent})" if origin else "  (copied in)"))
 
     def on_created(self, event):
-        """File copied/created inside the folder — no known origin."""
-        if not event.is_directory and self._is_relevant(event.src_path):
-            self._enqueue(event.src_path, origin_str=None)
+        if event.is_directory or not self._is_relevant(event.src_path):
+            return
+        p        = Path(event.src_path)
+        filename = p.name
+        resolved = str(p.resolve())
+
+        with self._lock:
+            if filename in self._pending:
+                # Already seen — cancel old timer, keep existing origin if any
+                self._pending[filename]['timer'].cancel()
+            timer = threading.Timer(MOVE_WINDOW, self._commit, args=[filename])
+            self._pending[filename] = {
+                'dest':   resolved,
+                'origin': self._pending.get(filename, {}).get('origin'),
+                'timer':  timer,
+            }
+            timer.start()
 
     def on_moved(self, event):
-        """File dragged/moved into the folder — origin is event.src_path."""
-        if not event.is_directory and self._is_relevant(event.dest_path):
-            self._enqueue(event.dest_path, origin_str=event.src_path)
+        if event.is_directory or not self._is_relevant(event.dest_path):
+            return
+        dest_p   = Path(event.dest_path)
+        filename = dest_p.name
+        resolved = str(dest_p.resolve())
+        origin   = event.src_path
+
+        with self._lock:
+            if filename in self._pending:
+                # Upgrade the pending entry with the real origin
+                self._pending[filename]['timer'].cancel()
+            timer = threading.Timer(MOVE_WINDOW, self._commit, args=[filename])
+            self._pending[filename] = {
+                'dest':   resolved,
+                'origin': origin,
+                'timer':  timer,
+            }
+            timer.start()
 
 
 # ═══════════════════════════════════════════════════════════════
-#  Popup dispatcher  (runs on main thread for Tkinter safety)
+#  Batch collector + dispatcher
 # ═══════════════════════════════════════════════════════════════
 
-def dispatch_popups(file_queue: queue.Queue, folder: str):
+def dispatch_popups(file_queue: queue.Queue, folders: list[str]):
+    """
+    Collects files that arrive within BATCH_WINDOW of each other,
+    shows ONE BatchGuardianPopup, then for each allowed file:
+      1. Shows the step-choice popup (2-step vs 4-step)
+      2. Shows the processing popup (live pipeline progress, auto-closes)
+
+    All popups run sequentially on the main thread (Tkinter requirement).
+    """
+    from popup import BatchGuardianPopup
+    from step_choice_popup import StepChoicePopup
+    from processing_popup import ProcessingPopup
+
+    _pipeline_available = False
+    try:
+        from v3.pipeline import run_pipeline
+        _pipeline_available = True
+    except ImportError as exc:
+        log.warning(f"V3 pipeline unavailable: {exc}")
+
+    def on_allow(filepath: str):
+        handle_allow(filepath)
+        if not _pipeline_available or not Path(filepath).exists():
+            return
+
+        watched_folder = str(Path(filepath).parent)
+
+        # 1) Ask the user: 2-step or 4-step workflow?
+        choice_popup = StepChoicePopup(filepath)
+        step_count = choice_popup.run()
+
+        if step_count not in (2, 4):
+            log.info(f"No workflow choice made for {Path(filepath).name} — skipping pipeline.")
+            return
+
+        log.info(f"User chose {step_count}-step workflow for {Path(filepath).name}")
+
+        # 2) Run the pipeline with a live processing popup
+        proc_popup = ProcessingPopup(filepath, watched_folder, step_count, run_pipeline)
+        result = proc_popup.run()
+
+        if result.get("error"):
+            log.error(f"Pipeline error for {Path(filepath).name}: {result['error']}")
+            return
+
+        if result.get("summary_path"):
+            log.info(f"RAG summary → {result['summary_path']}")
+        if result.get("workflow_summary_path"):
+            log.info(f"Workflow summary → {result['workflow_summary_path']}")
+        if result.get("source_path"):
+            log.info(f"Source archived → {result['source_path']}")
+        if result.get("analysis_path"):
+            log.info(f"Analysis → {result['analysis_path']}")
+        if result.get("output_docx_path"):
+            log.info(f"Generated DOCX → {result['output_docx_path']}")
+        if result.get("reviewed_docx_path"):
+            log.info(f"Reviewed DOCX → {result['reviewed_docx_path']}")
+        if result.get("review_path"):
+            log.info(f"Review notes → {result['review_path']}")
+
     log.info("Dispatcher ready — waiting for incoming files …\n")
 
     while True:
+        # Block until first file arrives
         try:
-            item = file_queue.get(timeout=1)
+            first = file_queue.get(timeout=1)
         except queue.Empty:
             continue
 
-        filepath, origin = item
+        batch = [first]
+        file_queue.task_done()
 
-        if not Path(filepath).exists():
-            log.warning(f"File vanished before popup: {filepath}")
-            file_queue.task_done()
+        # Collect more files that arrive within BATCH_WINDOW
+        deadline = time.time() + BATCH_WINDOW
+        while time.time() < deadline:
+            try:
+                item = file_queue.get(timeout=max(0.05, deadline - time.time()))
+                batch.append(item)
+                file_queue.task_done()
+                deadline = time.time() + BATCH_WINDOW   # reset window
+            except queue.Empty:
+                break
+
+        # Filter out files that vanished while waiting
+        batch = [(fp, orig) for fp, orig in batch if Path(fp).exists()]
+        if not batch:
             continue
 
-        log.info(f"Showing popup for  →  {Path(filepath).name}")
+        log.info(f"Batch of {len(batch)} file(s) ready for review.")
 
         try:
-            popup = GuardianPopup(
-                filepath = filepath,
-                folder   = folder,
-                on_allow = handle_allow,
-                on_deny  = lambda fp, orig=origin, f=folder: handle_deny(fp, f, orig),
+            popup = BatchGuardianPopup(
+                batch    = batch,
+                on_allow = on_allow,
+                on_deny  = handle_deny,
             )
-            popup.run()
+            allowed, denied = popup.run()
+            for fp in allowed:
+                on_allow(fp)
+            for fp, origin in denied:
+                handle_deny(fp, origin)
         except Exception as e:
             log.error(f"Popup error: {e}")
-
-        file_queue.task_done()
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -213,33 +263,41 @@ def dispatch_popups(file_queue: queue.Queue, folder: str):
 
 def main():
     if len(sys.argv) > 1:
-        folder = sys.argv[1]
+        raw_folders = sys.argv[1:]
     else:
-        folder = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                              'watched_folder')
+        default = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'watched_folder')
+        raw_folders = [default]
 
-    folder_path = Path(folder)
-    folder_path.mkdir(parents=True, exist_ok=True)
-    folder = str(folder_path.resolve())
+    if len(raw_folders) > 4:
+        log.warning("FolderGuardian supports up to 4 folders. Extra folders ignored.")
+        raw_folders = raw_folders[:4]
 
-    log.info(f"FolderGuardian  🛡")
-    log.info(f"Watching  →  {folder}")
-    log.info("Drop a supported file into the folder to test.\n")
+    folders = []
+    for f in raw_folders:
+        p = Path(f)
+        p.mkdir(parents=True, exist_ok=True)
+        folders.append(str(p.resolve()))
+
+    log.info("FolderGuardian  🛡")
+    for f in folders:
+        log.info(f"  Watching  →  {f}")
+    log.info("")
 
     file_queue: queue.Queue = queue.Queue()
-    handler    = FolderHandler(folder, file_queue)
-    observer   = Observer()
-    observer.schedule(handler, folder, recursive=False)
+    observer = Observer()
+    for folder in folders:
+        handler = FolderHandler(folder, file_queue)
+        observer.schedule(handler, folder, recursive=False)
     observer.start()
 
     try:
-        dispatch_popups(file_queue, folder)
+        dispatch_popups(file_queue, folders)
     except KeyboardInterrupt:
         log.info("\nStopping …")
     finally:
         observer.stop()
         observer.join()
-        log.info("FolderGuardian stopped. Goodbye.")
+        log.info("FolderGuardian stopped.")
 
 
 if __name__ == '__main__':
