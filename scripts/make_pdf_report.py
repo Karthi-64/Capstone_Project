@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# scripts/make_pdf_report.py — builds docs/FolderGuardian_Project_Report.pdf
+# scripts/make_pdf_report.py — builds ~/Downloads/FolderGuardian_Project_Report.pdf
 #
 # Usage:
 #   .venv/bin/python scripts/make_pdf_report.py
@@ -25,11 +25,8 @@ from reportlab.graphics.shapes import Drawing, Line, Polygon, Rect, String
 # ─────────────────────────────────────────────────────────────
 # Config
 # ─────────────────────────────────────────────────────────────
-OUT = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "docs",
-    "FolderGuardian_Project_Report.pdf",
-)
+OUT = os.path.join(os.path.expanduser("~"), "Downloads",
+                   "FolderGuardian_Project_Report.pdf")
 
 PAGE_W, PAGE_H = A4
 MARGIN = 2.2 * cm
